@@ -1,0 +1,30 @@
+World:
+	LuaScript:
+		Scripts: campaign.lua, adaptive-siege.lua
+	MapOptions:
+		ShortGameCheckboxLocked: True
+		ShortGameCheckboxEnabled: False
+		ShortGameCheckboxVisible: False
+	MapStartingLocations:
+		SeparateTeamSpawnsCheckboxEnabled: False
+		SeparateTeamSpawnsCheckboxLocked: True
+		SeparateTeamSpawnsCheckboxVisible: False
+	TimeLimitManager:
+		TimeLimitLocked: True
+		TimeLimitDropdownVisible: False
+	ScriptLobbyDropdown@difficulty:
+		ID: difficulty
+		Label: dropdown-difficulty.label
+		Description: dropdown-difficulty.description
+		Values:
+			easy: options-difficulty.easy
+			normal: options-difficulty.normal
+			hard: options-difficulty.hard
+			endless: options-difficulty.endless
+		Default: normal
+		DisplayOrder: 5
+
+Player:
+	-ConquestVictoryConditions:
+	MissionObjectives:
+		Cooperative: True
