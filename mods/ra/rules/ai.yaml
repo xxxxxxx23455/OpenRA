@@ -370,6 +370,7 @@ Player:
 		MinimumConstructionYardCount: 2
 	UnitBuilderBotModule@rush:
 		RequiresCondition: enable-rush-ai
+		CounterWeight: 100
 		UnitsToBuild:
 			e1: 65
 			e2: 15
@@ -410,6 +411,7 @@ Player:
 		ProtectionScanRadius: 12
 	UnitBuilderBotModule@normal:
 		RequiresCondition: enable-normal-ai
+		CounterWeight: 100
 		UnitsToBuild:
 			e1: 65
 			e2: 15
@@ -461,6 +463,7 @@ Player:
 		ProtectionScanRadius: 15
 	UnitBuilderBotModule@turtle:
 		RequiresCondition: enable-turtle-ai
+		CounterWeight: 100
 		UnitsToBuild:
 			e1: 65
 			e2: 15

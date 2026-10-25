@@ -9,10 +9,13 @@
  */
 #endregion
 
+using System;
 using System.Collections.Frozen;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
+using OpenRA.Mods.Common.Warheads;
+using OpenRA.Primitives;
 using OpenRA.Traits;
 
 namespace OpenRA.Mods.Common.Traits
@@ -44,6 +47,17 @@ namespace OpenRA.Mods.Common.Traits
 		[Desc("Only queue construction of a new unit when above this requirement.")]
 		public readonly int ProductionMinCashRequirement = 500;
 
+		[Desc("How strongly (in percent) the AI adapts its unit choice to counter the enemy units it has seen.",
+			"Units that deal more damage to the observed enemy armor and target types get a bigger share of `UnitsToBuild`.",
+			"0 disables this and keeps the plain `UnitsToBuild` shares.")]
+		public readonly int CounterWeight = 0;
+
+		[Desc("Lower limit (in percent) of how much countering may scale down the share of a unit.")]
+		public readonly int MinimumCounterShareModifier = 10;
+
+		[Desc("Upper limit (in percent) of how much countering may scale up the share of a unit.")]
+		public readonly int MaximumCounterShareModifier = 300;
+
 		public override object Create(ActorInitializer init) { return new UnitBuilderBotModule(init.Self, this); }
 	}
 
@@ -57,6 +71,9 @@ namespace OpenRA.Mods.Common.Traits
 
 		readonly List<string> queuedBuildRequests = [];
 		readonly ActorIndex.OwnerAndNames unitsToBuild;
+
+		// Enemy combat actors this bot has actually seen, used to pick counter units.
+		readonly HashSet<Actor> knownEnemies = [];
 
 		IBotRequestPauseUnitProduction[] requestPause;
 		int idleUnitCount;
@@ -188,6 +205,13 @@ namespace OpenRA.Mods.Common.Traits
 
 			var allUnits = unitsToBuild.Actors.Where(a => !a.IsDead).ToArray();
 
+			if (Info.CounterWeight > 0)
+			{
+				var counterUnit = ChooseCounterUnitToBuild(buildableThings, allUnits);
+				if (counterUnit != null)
+					return counterUnit;
+			}
+
 			ActorInfo desiredUnit = null;
 			var desiredError = int.MaxValue;
 			foreach (var unit in buildableThings)
@@ -212,6 +236,149 @@ namespace OpenRA.Mods.Common.Traits
 			}
 
 			return desiredUnit != null ? (HasAdequateAirUnitReloadBuildings(desiredUnit) ? desiredUnit : null) : null;
+		}
+
+		// Returns null when there is no known enemy army to counter, so the caller can fall back to the plain shares.
+		ActorInfo ChooseCounterUnitToBuild(ActorInfo[] buildableThings, Actor[] allUnits)
+		{
+			var enemyProfiles = UpdateKnownEnemies();
+			if (enemyProfiles.Count == 0)
+				return null;
+
+			var candidates = new List<(ActorInfo Unit, int Share, int Count, int Effectiveness)>();
+			foreach (var unit in buildableThings)
+			{
+				if (!Info.UnitsToBuild.TryGetValue(unit.Name, out var share) || share <= 0 ||
+					(Info.UnitDelays != null && Info.UnitDelays.TryGetValue(unit.Name, out var delay) && delay > world.WorldTick))
+					continue;
+
+				var unitCount = allUnits.Count(a => a.Info.Name == unit.Name);
+				if (Info.UnitLimits != null && Info.UnitLimits.TryGetValue(unit.Name, out var count) && unitCount >= count)
+					continue;
+
+				if (!HasAdequateAirUnitReloadBuildings(unit))
+					continue;
+
+				candidates.Add((unit, share, unitCount, EffectivenessAgainst(unit, enemyProfiles)));
+			}
+
+			// Units without damaging weapons (harvesters, engineers, medics, ...) keep their plain share
+			// and are not taken into account for the average effectiveness.
+			var combatEffectiveness = candidates.Where(c => c.Effectiveness >= 0).Select(c => c.Effectiveness).ToArray();
+			if (combatEffectiveness.Length == 0)
+				return null;
+
+			var averageEffectiveness = combatEffectiveness.Sum() / combatEffectiveness.Length;
+			if (averageEffectiveness <= 0)
+				return null;
+
+			var adjustedShares = candidates.Select(c =>
+			{
+				if (c.Effectiveness < 0)
+					return c.Share;
+
+				var relativeEffectiveness = c.Effectiveness * 100 / averageEffectiveness;
+				var modifier = (100 + Info.CounterWeight * (relativeEffectiveness - 100) / 100)
+					.Clamp(Info.MinimumCounterShareModifier, Info.MaximumCounterShareModifier);
+
+				return c.Share * modifier / 100;
+			}).ToArray();
+
+			var totalShare = adjustedShares.Sum();
+			var totalCount = candidates.Sum(c => c.Count);
+			if (totalShare <= 0)
+				return null;
+
+			// Pick the unit that is furthest below its adjusted share once one more unit has been built.
+			// buildableThings is shuffled, so ties are broken randomly.
+			var bestIndex = -1;
+			var bestDeficit = long.MinValue;
+			for (var i = 0; i < candidates.Count; i++)
+			{
+				var deficit = (long)adjustedShares[i] * (totalCount + 1) - (long)candidates[i].Count * totalShare;
+				if (deficit > bestDeficit)
+				{
+					bestDeficit = deficit;
+					bestIndex = i;
+				}
+			}
+
+			if (bestIndex < 0)
+				return null;
+
+			var (chosenUnit, chosenShare, _, chosenEffectiveness) = candidates[bestIndex];
+			AIUtils.BotDebug("{0} decided to build {1}: counter share {2} (base {3}, effectiveness {4}% vs average {5}%)",
+				player, chosenUnit.Name, adjustedShares[bestIndex], chosenShare, chosenEffectiveness, averageEffectiveness);
+
+			return chosenUnit;
+		}
+
+		// Remembers every enemy combat actor the bot can currently see and returns
+		// the remembered army as total cost per (actor type, target types).
+		Dictionary<(ActorInfo Info, BitSet<TargetableType> TargetTypes), int> UpdateKnownEnemies()
+		{
+			knownEnemies.RemoveWhere(a => a.IsDead || !a.IsInWorld || player.RelationshipWith(a.Owner) != PlayerRelationship.Enemy);
+
+			foreach (var a in world.ActorsHavingTrait<Armament>())
+			{
+				if (a.IsDead || !a.IsInWorld || player.RelationshipWith(a.Owner) != PlayerRelationship.Enemy ||
+					a.Info.HasTraitInfo<HuskInfo>() || !a.CanBeViewedByPlayer(player))
+					continue;
+
+				knownEnemies.Add(a);
+			}
+
+			var profiles = new Dictionary<(ActorInfo Info, BitSet<TargetableType> TargetTypes), int>();
+			foreach (var a in knownEnemies)
+			{
+				var targetTypes = a.GetEnabledTargetTypes();
+				if (targetTypes.IsEmpty)
+					continue;
+
+				var key = (a.Info, targetTypes);
+				var cost = a.Info.TraitInfoOrDefault<ValuedInfo>()?.Cost ?? 0;
+				profiles[key] = profiles.GetValueOrDefault(key) + Math.Max(cost, 1);
+			}
+
+			return profiles;
+		}
+
+		// Cost-weighted average of how well the unit's best weapon suits the enemy army, from 0 to 100.
+		// Versus values are relative to each warhead's own base damage, so they are normalized by the
+		// warhead's best Versus value to make different units comparable. Returns -1 for units that have no damaging weapon.
+		static int EffectivenessAgainst(ActorInfo unit, Dictionary<(ActorInfo Info, BitSet<TargetableType> TargetTypes), int> enemyProfiles)
+		{
+			var damageWarheads = unit.TraitInfos<ArmamentInfo>()
+				.Where(a => a.WeaponInfo != null)
+				.SelectMany(a => a.WeaponInfo.Warheads.OfType<DamageWarhead>()
+					.Where(w => w.Damage > 0)
+					.Select(w => (a.WeaponInfo, Warhead: w, BestVersus: w.Versus.Values.Append(100).Max())))
+				.ToArray();
+
+			if (damageWarheads.Length == 0)
+				return -1;
+
+			long totalWeight = 0;
+			long totalEffectiveness = 0;
+			foreach (var (enemy, weight) in enemyProfiles)
+			{
+				var armorTypes = enemy.Info.TraitInfos<ArmorInfo>().Where(a => a.Type != null).Select(a => a.Type).ToArray();
+				var best = 0;
+				foreach (var (weapon, warhead, bestVersus) in damageWarheads)
+				{
+					if (!weapon.IsValidTarget(enemy.TargetTypes) ||
+						!warhead.ValidTargets.Overlaps(enemy.TargetTypes) || warhead.InvalidTargets.Overlaps(enemy.TargetTypes))
+						continue;
+
+					var versus = Util.ApplyPercentageModifiers(100, armorTypes.Where(warhead.Versus.ContainsKey).Select(t => warhead.Versus[t]));
+					best = Math.Max(best, versus * 100 / bestVersus);
+				}
+
+				totalWeight += weight;
+				totalEffectiveness += (long)best * weight;
+			}
+
+			return totalWeight > 0 ? (int)(totalEffectiveness / totalWeight) : -1;
 		}
 
 		// For mods like RA (number of RearmActors must match the number of aircraft)
